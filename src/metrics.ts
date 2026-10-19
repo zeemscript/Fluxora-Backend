@@ -1,4 +1,5 @@
 import { Registry, collectDefaultMetrics, Counter, Histogram, Gauge } from 'prom-client';
+import { assertCollectorLabels } from './metrics/cardinality.js';
 
 /** Dedicated registry so default Node.js metrics don't leak into other registries. */
 export const registry = new Registry();
@@ -11,6 +12,8 @@ collectDefaultMetrics({ register: registry });
  * Total HTTP requests received, partitioned by method, route, and status code.
  * Operators can alert on error-rate spikes (5xx) or track traffic distribution.
  */
+assertCollectorLabels(['method', 'route', 'status_code']);
+
 export const httpRequestsTotal = new Counter({
   name: 'http_requests_total',
   help: 'Total number of HTTP requests',
@@ -35,6 +38,8 @@ export const httpRequestDurationSeconds = new Histogram({
  * Total requests rejected by the rate limiter with a 429 response.
  * Labels: identifier_type ('ip' | 'apiKey'), route (path or 'global').
  */
+assertCollectorLabels(['identifier_type', 'route']);
+
 export const rateLimitRejectedTotal = new Counter({
   name: 'rate_limit_rejected_total',
   help: 'Total requests rejected by the rate limiter (HTTP 429)',
@@ -153,3 +158,22 @@ export function recordConfigReloadFailure(durationMs: number): void {
   configReloadTotal.inc({ result: 'failure' });
   configReloadDurationSeconds.observe(durationMs / 1000);
 }
+
+/**
+ * Total hits on deprecated routes, partitioned by route path.
+ *
+ * Lets operators build dashboards and alerts for deprecated-route traffic so
+ * they know whether clients have migrated before the sunset date arrives.
+ * Label `route` is the configured route prefix (e.g. `/api/rate-limits/config`),
+ * never the raw request path, keeping cardinality bounded.
+ */
+assertCollectorLabels(['route']);
+
+export const deprecatedRouteHitsTotal: Counter<'route'> =
+  (registry.getSingleMetric('fluxora_deprecated_route_hits_total') as Counter<'route'>) ||
+  new Counter({
+    name: 'fluxora_deprecated_route_hits_total',
+    help: 'Total hits on deprecated routes — use this to verify client migration before a sunset date.',
+    labelNames: ['route'] as const,
+    registers: [registry],
+  });

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * OpenTelemetry SDK bootstrap for Fluxora Backend.
  *
@@ -24,7 +25,7 @@ import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { ExpressInstrumentation } from '@opentelemetry/instrumentation-express';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { IORedisInstrumentation } from '@opentelemetry/instrumentation-ioredis';
-import { Resource } from '@opentelemetry/resources';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -63,24 +64,24 @@ let sdk: NodeSDK | null = null;
  * Returns true if the SDK was started, false if disabled or already running.
  */
 export function startTracing(): boolean {
-  if (process.env.OTEL_SDK_DISABLED === 'true') return false;
+  if (getRuntimeEnv().OTEL_SDK_DISABLED === 'true') return false;
   if (sdk !== null) return false;
 
   try {
     const endpoint = safeUrl(
-      process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+      getRuntimeEnv().OTEL_EXPORTER_OTLP_ENDPOINT,
       'http://localhost:4318',
     );
 
     const exporter = new OTLPTraceExporter({
       url: `${endpoint}/v1/traces`,
-      headers: parseOtlpHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS),
+      headers: parseOtlpHeaders(getRuntimeEnv().OTEL_EXPORTER_OTLP_HEADERS),
     });
 
     sdk = new NodeSDK({
-      resource: new Resource({
-        [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'fluxora-backend',
-        [ATTR_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
+      resource: resourceFromAttributes({
+        [ATTR_SERVICE_NAME]: getRuntimeEnv().OTEL_SERVICE_NAME ?? 'fluxora-backend',
+        [ATTR_SERVICE_VERSION]: getRuntimeEnv().npm_package_version ?? '0.0.0',
       }),
       traceExporter: exporter,
       instrumentations: [
@@ -170,13 +171,13 @@ import type { SamplingConfig } from './hooks.js';
  * @returns A fully-typed {@link SamplingConfig} representing the current config.
  */
 export function getSamplingConfig(): SamplingConfig {
-  const strategy = (process.env.TRACING_SAMPLING_STRATEGY ?? 'head') as string;
+  const strategy = (getRuntimeEnv().TRACING_SAMPLING_STRATEGY ?? 'head') as string;
 
   // Shared helpers
   const parseRate = (raw: string | undefined, fallback: number): number => {
     if (!raw || raw.trim() === '') return fallback;
     const n = Number.parseFloat(raw);
-    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+    return Number.isFinite(n) && !Number.isNaN(n) && n >= 0 && n <= 1 ? n : fallback;
   };
 
   const parseBool = (raw: string | undefined, fallback: boolean): boolean => {
@@ -187,7 +188,7 @@ export function getSamplingConfig(): SamplingConfig {
     return fallback;
   };
 
-  const globalRate = parseRate(process.env.TRACING_SAMPLE_RATE, 1);
+  const globalRate = parseRate(getRuntimeEnv().TRACING_SAMPLE_RATE, 1);
 
   if (strategy === 'always') return { strategy: 'always' };
   if (strategy === 'never') return { strategy: 'never' };
@@ -195,43 +196,45 @@ export function getSamplingConfig(): SamplingConfig {
   if (strategy === 'tail') {
     return {
       strategy: 'tail',
-      sampleRate: parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate),
-      keepErrorSpans: parseBool(process.env.TRACING_TAIL_KEEP_ERRORS, true),
+      sampleRate: parseRate(getRuntimeEnv().TRACING_HEAD_SAMPLE_RATE, globalRate),
+      keepErrorSpans: parseBool(getRuntimeEnv().TRACING_TAIL_KEEP_ERRORS, true),
     };
   }
 
   // Default: head-based sampling
-  const headRate = parseRate(process.env.TRACING_HEAD_SAMPLE_RATE, globalRate);
+  const headRate = parseRate(getRuntimeEnv().TRACING_HEAD_SAMPLE_RATE, globalRate);
 
-  let perRouteOverrides: Record<string, number> | undefined;
-  const rawOverrides = process.env.TRACING_PER_ROUTE_OVERRIDES;
-  if (rawOverrides && rawOverrides.trim().length > 0) {
+  const parseOverrides = (raw: string | undefined, name: string): Record<string, number> | undefined => {
+    if (!raw || raw.trim().length === 0) return undefined;
     try {
-      const parsed = JSON.parse(rawOverrides) as unknown;
+      const parsed = JSON.parse(raw) as unknown;
       if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        // Validate: only keep entries with numeric values in [0, 1]
         const validated: Record<string, number> = {};
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-          if (typeof v === 'number' && v >= 0 && v <= 1) {
+          if (typeof v === 'number' && Number.isFinite(v) && !Number.isNaN(v) && v >= 0 && v <= 1) {
             validated[k] = v;
           }
         }
         if (Object.keys(validated).length > 0) {
-          perRouteOverrides = validated;
+          return validated;
         }
       }
     } catch {
-      // Malformed JSON — ignore overrides, log to stderr for visibility
       process.stderr.write(
-        `[tracing] TRACING_PER_ROUTE_OVERRIDES is not valid JSON — per-route overrides disabled\n`,
+        `[tracing] ${name} is not valid JSON — overrides disabled\n`,
       );
     }
-  }
+    return undefined;
+  };
+
+  const perRouteOverrides = parseOverrides(getRuntimeEnv().TRACING_PER_ROUTE_OVERRIDES, 'TRACING_PER_ROUTE_OVERRIDES');
+  const perTenantOverrides = parseOverrides(getRuntimeEnv().TRACING_PER_TENANT_OVERRIDES, 'TRACING_PER_TENANT_OVERRIDES');
 
   const config: SamplingConfig = {
     strategy: 'head',
     sampleRate: headRate,
     ...(perRouteOverrides !== undefined ? { perRouteOverrides } : {}),
+    ...(perTenantOverrides !== undefined ? { perTenantOverrides } : {}),
   };
   return config;
 }
@@ -261,15 +264,15 @@ export function getOTelBatchConfig(): OTelBatchConfig {
 
   return {
     maxExportBatchSize: parseNum(
-      process.env.OTEL_BSP_MAX_EXPORT_BATCH_SIZE ?? process.env.TRACING_BATCH_MAX_SIZE,
+      getRuntimeEnv().OTEL_BSP_MAX_EXPORT_BATCH_SIZE ?? getRuntimeEnv().TRACING_BATCH_MAX_SIZE,
       512,
     ),
     scheduledDelayMillis: parseNum(
-      process.env.OTEL_BSP_SCHEDULED_DELAY_MILLIS ?? process.env.TRACING_BATCH_TIMEOUT_MS,
+      getRuntimeEnv().OTEL_BSP_SCHEDULED_DELAY_MILLIS ?? getRuntimeEnv().TRACING_BATCH_TIMEOUT_MS,
       5000,
     ),
     maxQueueSize: parseNum(
-      process.env.OTEL_BSP_MAX_QUEUE_SIZE ?? process.env.TRACING_BATCH_QUEUE_SIZE,
+      getRuntimeEnv().OTEL_BSP_MAX_QUEUE_SIZE ?? getRuntimeEnv().TRACING_BATCH_QUEUE_SIZE,
       2048,
     ),
   };

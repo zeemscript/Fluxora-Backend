@@ -5,7 +5,7 @@ Get the contract event indexer running in 5 minutes.
 ## Prerequisites
 
 - Docker & Docker Compose (recommended)
-- OR Node.js 18+ and PostgreSQL 12+
+- OR Node.js 20.20.2 (see `.nvmrc`) and PostgreSQL 12+
 
 ## Option 1: Docker (Recommended)
 
@@ -82,11 +82,12 @@ docker-compose exec indexer pnpm run benchmark
 ### 1. Install Dependencies
 
 ```bash
-# Install pnpm if not already installed
-npm install -g pnpm
+# Activate the pnpm version pinned in package.json
+corepack enable
+corepack prepare pnpm@9.15.9 --activate
 
 # Install project dependencies
-pnpm install
+pnpm install --frozen-lockfile
 ```
 
 ### 2. Configure Environment

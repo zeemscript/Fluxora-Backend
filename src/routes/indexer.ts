@@ -1,3 +1,5 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Indexer routes.
  *
@@ -29,14 +31,18 @@ import {
   INDEXER_RATE_LIMIT_WINDOW_MS,
   defaultIndexerEventStore,
   indexerIngestionService,
-  indexerService,
-} from '../indexer/service.js';
+} from '../indexer/ingestion.js';
+import { indexerService, replayLock, replayState } from '../indexer/service.js';
 import { IndexerDependencyState } from '../indexer/types.js';
 import { authenticate, requireAuth, requirePermission, Permission } from '../middleware/auth.js';
 import { successResponse, errorResponse } from '../utils/response.js';
 import { ReplayRequestSchema, parseBody, formatZodIssues } from '../validation/schemas.js';
+import { ReplayProgress } from '../types/index.js';
 import { logger } from '../lib/logger.js';
 import { mtlsValidationMiddleware } from '../indexer/mtls.js';
+import { getReindexLock } from '../state/adminState.js';
+import { AdminStateLockError, Lock } from '../state/adminStateLock.js';
+import { recordAuditEvent } from '../lib/auditLog.js';
 
 export const indexerRouter = Router();
 
@@ -46,7 +52,7 @@ indexerRouter.use(mtlsValidationMiddleware);
 // ── Internal worker-token auth ────────────────────────────────────────────────
 
 const INDEXER_AUTH_HEADER = 'x-indexer-worker-token';
-let indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+let indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
 
 function resolveActor(req: any): string {
   const forwardedFor = req.header('x-forwarded-for');
@@ -191,13 +197,58 @@ indexerRouter.post(
 
     const { contract_id, ledger, from_block, to_block } = parsed.data;
 
-    indexerService.replayEvents({ contract_id, ledger, from_block, to_block }).catch((err: unknown) => {
-      logger.error('Replay failed', correlationId, {
-        contract_id,
-        ledger,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    if (from_block !== undefined && to_block !== undefined && from_block > to_block) {
+      res.status(400).json(
+        errorResponse('VALIDATION_ERROR', 'from_block cannot be greater than to_block', undefined, requestId),
+      );
+      return;
+    }
+
+    // Guard against concurrent control operations
+    if (replayLock.isHeld() || indexerService.getReplayProgress().isReplaying) {
+      res.status(409).json(
+        errorResponse('CONFLICT', 'Replay operation already in progress', undefined, requestId),
+      );
+      return;
+    }
+
+    const lockProvider = getReindexLock();
+    let lock: Lock | undefined;
+
+    if (lockProvider) {
+      try {
+        lock = await lockProvider.acquire();
+      } catch (err) {
+        if (err instanceof AdminStateLockError) {
+          res.status(409).json(
+            errorResponse('CONFLICT', 'A reindex operation is already in progress.', undefined, requestId),
+          );
+          return;
+        }
+        throw err;
+      }
+    }
+
+    recordAuditEvent('REINDEX_TRIGGERED', 'indexer', 'admin', correlationId, {
+      contract_id,
+      ledger,
+      from_block,
+      to_block,
     });
+
+    indexerService.replayEvents({ contract_id, ledger, from_block, to_block })
+      .catch((err: unknown) => {
+        logger.error('Replay failed', correlationId, {
+          contract_id,
+          ledger,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (lock) {
+          lock.release().catch(() => {});
+        }
+      });
 
     logger.info('Replay started', correlationId, { contract_id, ledger, from_block, to_block });
 
@@ -225,7 +276,7 @@ indexerRouter.get(
     try {
       // Use the DB-backed extended snapshot so persisted replay checkpoints
       // survive restarts (falls back to the in-memory snapshot on read error).
-      const progress = await indexerService.getReplayProgressExtended();
+      const progress: ReplayProgress = await indexerService.getReplayProgressExtended();
       res.status(200).json(successResponse(progress, requestId));
     } catch (err: unknown) {
       logger.error('Failed to get indexer status', correlationId, {
@@ -237,6 +288,8 @@ indexerRouter.get(
 );
 
 // ── Test helpers (consumed by tests only) ────────────────────────────────────
+
+export { replayLock, replayState };
 
 export function setIndexerIngestAuthToken(token: string): void {
   indexerWorkerToken = token;
@@ -256,7 +309,9 @@ export function resetIndexerState(): void {
   }
   indexerIngestionService.setStore(defaultIndexerEventStore);
   indexerIngestionService.resetRuntimeState();
-  indexerWorkerToken = process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  indexerWorkerToken = getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token';
+  replayLock.release();
+  replayState.endReplay();
 }
 
 export function getIndexerHealth() {

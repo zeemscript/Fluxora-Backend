@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * gRPC transcoding gateway for the Fluxora indexer.
  *
@@ -31,12 +32,24 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import protobuf from 'protobufjs';
 import { getConfig } from '../config/env.js';
-import {
-  indexerIngestionService,
-  indexerService,
-} from './service.js';
+import { indexerIngestionService } from './ingestion.js';
+import { indexerService } from './service.js';
 import { logger } from '../lib/logger.js';
 import { ReplayRequestSchema } from '../validation/schemas.js';
+
+/**
+ * gRPC Gateway Limits
+ * 
+ * Keep protobuf decoding, response buffering, and concurrent streams bounded.
+ * These limits prevent unauthenticated peers from reserving unbounded memory or
+ * exhausting connection resources before authentication runs.
+ * 
+ * - Max Message Bytes: 4MB. Exceeding this produces RESOURCE_EXHAUSTED.
+ * - Max Concurrent Streams: 100 per client. Exceeding this delays requests or produces UNAVAILABLE.
+ */
+export const GRPC_GATEWAY_MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
+export const GRPC_GATEWAY_MAX_CONCURRENT_STREAMS = 100;
+export const GRPC_GATEWAY_DEADLINE_MS = 30_000;
 
 // ── Proto definition (inline — no disk reads in production) ─────────────────
 //
@@ -300,7 +313,7 @@ function checkWorkerToken(
     }) as grpc.ServiceError;
   }
 
-  const expected = (process.env.INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token').trim();
+  const expected = (getRuntimeEnv().INDEXER_WORKER_TOKEN ?? 'fluxora-dev-indexer-token').trim();
   if (!timingSafeEqual(provided, expected)) {
     return Object.assign(new Error('worker_token authentication failed'), {
       code: grpc.status.UNAUTHENTICATED,
@@ -308,6 +321,76 @@ function checkWorkerToken(
   }
 
   return null;
+}
+
+class GatewayCallError extends Error {
+  constructor(message: string, readonly code: grpc.status) {
+    super(message);
+    this.name = 'GatewayCallError';
+  }
+}
+
+interface GatewayCall {
+  cancelled: boolean;
+  once(event: 'cancelled', listener: () => void): unknown;
+  removeListener(event: 'cancelled', listener: () => void): unknown;
+}
+
+/**
+ * Bound handler work and stop delivering results after a client disappears.
+ * The underlying service call is deliberately not retried: replay and ingest
+ * are not generally idempotent at this boundary, and a cancelled RPC cannot
+ * safely be assumed to have rolled back its database work.
+ */
+function runWithCallPolicy<T>(
+  call: GatewayCall,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (call.cancelled) {
+    return Promise.reject(new GatewayCallError('gRPC call was cancelled', grpc.status.CANCELLED));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      cleanup();
+      reject(new GatewayCallError('gRPC gateway deadline exceeded', grpc.status.DEADLINE_EXCEEDED));
+    }, GRPC_GATEWAY_DEADLINE_MS);
+
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      call.removeListener('cancelled', onCancelled);
+    };
+    const onCancelled = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new GatewayCallError('gRPC call was cancelled', grpc.status.CANCELLED));
+    };
+
+    call.once('cancelled', onCancelled);
+    Promise.resolve().then(operation).then((value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    }, (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+  });
+}
+
+function callbackIfActive<T>(
+  call: { cancelled: boolean },
+  callback: grpc.sendUnaryData<T>,
+  error?: grpc.ServiceError,
+  response?: T,
+): void {
+  if (!call.cancelled) callback(error ?? null, response);
 }
 
 // ── RPC handler implementations ───────────────────────────────────────────────
@@ -345,12 +428,12 @@ async function handleIngestContractEvents(
       ledgerHash: e.ledgerHash,
     }));
 
-    const result = await indexerIngestionService.ingest(
+    const result = await runWithCallPolicy(call, () => indexerIngestionService.ingest(
       { events: domainEvents },
       { actor: peer },
-    );
+    ));
 
-    callback(null, {
+    callbackIfActive(call, callback, undefined, {
       insertedCount: result.insertedCount,
       duplicateCount: result.duplicateCount,
       insertedEventIds: result.insertedEventIds,
@@ -362,9 +445,9 @@ async function handleIngestContractEvents(
       peer,
       error: err instanceof Error ? err.message : String(err),
     });
-    callback(Object.assign(
+    callbackIfActive(call, callback, Object.assign(
       new Error(err instanceof Error ? err.message : 'Ingest failed'),
-      { code: grpc.status.INTERNAL },
+      { code: err instanceof GatewayCallError ? err.code : grpc.status.INTERNAL },
     ) as grpc.ServiceError);
   }
 }
@@ -393,7 +476,7 @@ async function handleGetEvents(
       ...(req.afterEventId ? { afterEventId: req.afterEventId } : {}),
     };
 
-    const result = await indexerIngestionService.getEvents(filter);
+    const result = await runWithCallPolicy(call, () => indexerIngestionService.getEvents(filter));
 
     const events: GrpcStreamEventRecord[] = (result.events ?? []).map((e: import('../db/types.js').StreamEventRecord) => ({
       eventId: e.eventId ?? '',
@@ -406,7 +489,7 @@ async function handleGetEvents(
       ledgerHash: (e as unknown as Record<string, unknown>).ledger_hash as string ?? '',
     }));
 
-    callback(null, {
+    callbackIfActive(call, callback, undefined, {
       events,
       total: result.total,
       limit: result.limit,
@@ -419,9 +502,9 @@ async function handleGetEvents(
       peer,
       error: err instanceof Error ? err.message : String(err),
     });
-    callback(Object.assign(
+    callbackIfActive(call, callback, Object.assign(
       new Error(err instanceof Error ? err.message : 'GetEvents failed'),
-      { code: grpc.status.INTERNAL },
+      { code: err instanceof GatewayCallError ? err.code : grpc.status.INTERNAL },
     ) as grpc.ServiceError);
   }
 }
@@ -458,6 +541,13 @@ async function handleReplayEvents(
     }
 
     // Fire-and-forget, same as the HTTP route
+    if (call.cancelled) {
+      callbackIfActive(call, callback, Object.assign(
+        new Error('gRPC call was cancelled'),
+        { code: grpc.status.CANCELLED },
+      ) as grpc.ServiceError);
+      return;
+    }
     indexerService.replayEvents(parsed.data).catch((err: unknown) => {
       logger.error('grpc_gateway_replay_error', undefined, {
         event: 'grpc_gateway_replay_error',
@@ -467,7 +557,7 @@ async function handleReplayEvents(
     });
 
     const progress = indexerService.getReplayProgress();
-    callback(null, {
+    callbackIfActive(call, callback, undefined, {
       message: 'Replay started',
       isReplaying: progress.isReplaying,
       rowsReplayed: progress.rowsReplayed,
@@ -480,7 +570,7 @@ async function handleReplayEvents(
       peer,
       error: err instanceof Error ? err.message : String(err),
     });
-    callback(Object.assign(
+    callbackIfActive(call, callback, Object.assign(
       new Error(err instanceof Error ? err.message : 'ReplayEvents failed'),
       { code: grpc.status.INTERNAL },
     ) as grpc.ServiceError);
@@ -500,8 +590,8 @@ async function handleGetReplayStatus(
 
   const peer = call.getPeer();
   try {
-    const progress = await indexerService.getReplayProgressExtended();
-    callback(null, {
+    const progress = await runWithCallPolicy(call, () => indexerService.getReplayProgressExtended());
+    callbackIfActive(call, callback, undefined, {
       isReplaying: progress.isReplaying,
       rowsReplayed: progress.rowsReplayed,
       rowsRemaining: progress.rowsRemaining,
@@ -525,9 +615,9 @@ async function handleGetReplayStatus(
       peer,
       error: err instanceof Error ? err.message : String(err),
     });
-    callback(Object.assign(
+    callbackIfActive(call, callback, Object.assign(
       new Error(err instanceof Error ? err.message : 'GetReplayStatus failed'),
-      { code: grpc.status.INTERNAL },
+      { code: err instanceof GatewayCallError ? err.code : grpc.status.INTERNAL },
     ) as grpc.ServiceError);
   }
 }
@@ -541,7 +631,11 @@ async function handleGetReplayStatus(
  * nothing and the module-level singletons are used.
  */
 export function createGrpcGatewayServer(): grpc.Server {
-  const server = new grpc.Server();
+  const server = new grpc.Server({
+    'grpc.max_receive_message_length': GRPC_GATEWAY_MAX_MESSAGE_BYTES,
+    'grpc.max_send_message_length': GRPC_GATEWAY_MAX_MESSAGE_BYTES,
+    'grpc.max_concurrent_streams': GRPC_GATEWAY_MAX_CONCURRENT_STREAMS,
+  });
 
   server.addService(INDEXER_SERVICE_DEFINITION, {
     IngestContractEvents: (call: grpc.ServerUnaryCall<IngestRequest, IngestResponse>, cb: grpc.sendUnaryData<IngestResponse>) =>

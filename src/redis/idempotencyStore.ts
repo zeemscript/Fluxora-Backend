@@ -1,17 +1,21 @@
 /**
  * Redis-backed idempotency store for POST /api/streams.
  *
- * Stores the full HTTP response (status code + body) keyed by the
- * caller-supplied Idempotency-Key so that replayed requests return the
- * exact same response without re-executing the business logic.
+ * Entries are scoped by tenant ID and caller-supplied Idempotency-Key. The
+ * idempotency window starts when `start()` acquires the key; `set()` preserves
+ * the remaining window instead of granting a slow request a fresh TTL. A
+ * standalone `set()` starts its window when the response is written. The
+ * configured window defaults to 86 400 seconds (24 hours).
  *
  * Graceful degradation
  * --------------------
- * If Redis is unavailable (get/set throws), the store logs a warning and
- * returns null / silently skips the write.  The optional `onStateChange`
- * callback is invoked with `false` on error and `true` on recovery so that
- * callers can flip an upstream dependency-health flag (→ 503 rather than
- * silently losing idempotency guarantees).
+ * If Redis is unavailable, `get()` returns a cache miss, `start()` fails open
+ * as though it acquired the key, and `set()` skips persistence. The optional
+ * `onStateChange` callback reports the failure. Production wiring marks the
+ * dependency unavailable, causing POST /api/streams to return 503 until Redis
+ * recovers; callers that do not use this callback have best-effort semantics
+ * during the outage. `NoOpIdempotencyStore` always processes requests without
+ * duplicate protection.
  *
  * Security notes
  * --------------
@@ -20,15 +24,15 @@
  * - Stored fingerprints are SHA-256 of the normalised request body, so a
  *   different payload under the same key cannot silently overwrite a cached
  *   response — it produces a 409 CONFLICT instead.
- * - TTL is enforced by Redis EX so entries are automatically evicted after
- *   the configured window (default 86 400 s / 24 h).
+ * - TTL is enforced by Redis so entries are automatically evicted after the
+ *   configured window, measured from lock acquisition when one was acquired.
  * - The stored value is JSON-serialised; no eval or dynamic code paths.
  *
  * @module redis/idempotencyStore
  */
 
 import type { RedisClient } from './client.js';
-import { logger as defaultLogger } from '../logging/logger.js';
+import { logger as defaultLogger } from '../lib/logger.js';
 import { correlationStore } from '../tracing/middleware.js';
 
 export const IDEMPOTENCY_KEY_PREFIX = 'fluxora:idempotency:';
@@ -106,16 +110,26 @@ function parseAndValidateEnvelope<T>(
 
 export interface IdempotencyStore<T = unknown> {
   /**
+  * Acquire a tenant-scoped lock for the idempotency key and begin its expiry
+  * window. The lock and any response later stored for it share this deadline.
+   * Returns true if acquired (first write), false if already exists or in progress.
+   */
+  start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean>;
+
+  /**
    * Retrieve a previously stored response.
+   * Returns 'in_progress' if the request is still executing.
    * Returns null on cache miss or Redis unavailability.
    */
-  get(key: string): Promise<IdempotentEntry<T> | null>;
+  get(key: string, tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null>;
 
   /**
    * Persist a response for future replays.
-   * Silently no-ops on Redis unavailability.
+    * Retains the deadline established by `start()`; if called without a prior
+    * start, `ttlSeconds` begins when this response is written. Silently skips
+    * persistence on Redis unavailability.
    */
-  set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void>;
+  set(key: string, tenantId: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void>;
 
   /** Release any external resources (e.g. Redis connection) held by this store. */
   close(): Promise<void>;
@@ -146,6 +160,7 @@ export interface RedisIdempotencyStoreOptions {
 export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
   private readonly onStateChange?: (healthy: boolean) => void;
   private readonly logger: typeof defaultLogger;
+  private readonly expiryByKey = new Map<string, number>();
 
   /**
    * @param client  The Redis client to use for storage.
@@ -159,15 +174,49 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
     this.logger = options?.logger ?? defaultLogger;
   }
 
-  private buildKey(key: string): string {
-    return `${IDEMPOTENCY_KEY_PREFIX}${key}`;
+  private buildKey(key: string, tenantId: string): string {
+    return `${IDEMPOTENCY_KEY_PREFIX}${tenantId}:${key}`;
   }
 
-  async get(key: string): Promise<IdempotentEntry<T> | null> {
+  private pruneExpiredDeadlines(exceptKey?: string): void {
+    const now = Date.now();
+    for (const [fullKey, expiresAt] of this.expiryByKey) {
+      if (fullKey !== exceptKey && expiresAt <= now) this.expiryByKey.delete(fullKey);
+    }
+  }
+
+  async start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean> {
+    const fullKey = this.buildKey(key, tenantId);
+    this.pruneExpiredDeadlines();
+    const expiresAt = Date.now() + ttlSeconds * 1000;
     try {
-      const raw = await this.client.get(this.buildKey(key));
+      const result = await this.client.setNx(fullKey, 'IN_PROGRESS', ttlSeconds * 1000);
+      this.onStateChange?.(true);
+      if (result) this.expiryByKey.set(fullKey, expiresAt);
+      const fullKey = this.buildKey(key, tenantId);
+      const result = await this.client.setNx(fullKey, 'IN_PROGRESS', ttlSeconds * 1000);
+      this.onStateChange?.(true);
+      return result;
+    } catch (err) {
+      this.onStateChange?.(false);
+      this.expiryByKey.set(fullKey, expiresAt);
+      this.logger.warn('Idempotency store: Redis start failed — failing open', correlationStore.getStore(), {
+        operation: 'start',
+        keyLength: key.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Fail open: assume lock acquired if Redis is down
+      return true;
+    }
+  }
+
+  async get(key: string, tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null> {
+    this.pruneExpiredDeadlines();
+    try {
+      const raw = await this.client.get(this.buildKey(key, tenantId));
       this.onStateChange?.(true);
       if (raw === null) return null;
+      if (raw === 'IN_PROGRESS') return 'in_progress';
 
       const result = parseAndValidateEnvelope<T>(raw);
       if (result.invalidReason !== undefined) {
@@ -190,10 +239,20 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
     }
   }
 
-  async set(key: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
+  async set(key: string, tenantId: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
+    const fullKey = this.buildKey(key, tenantId);
+    this.pruneExpiredDeadlines(fullKey);
+    const expiresAt = this.expiryByKey.get(fullKey);
+    const deadline = expiresAt ?? Date.now() + ttlSeconds * 1000;
+
+    if (deadline <= Date.now()) {
+      this.expiryByKey.delete(fullKey);
+      return;
+    }
+
     try {
       const versioned: IdempotentEntry<T> = { ...entry, version: ENVELOPE_VERSION };
-      await this.client.set(this.buildKey(key), JSON.stringify(versioned), { ex: ttlSeconds });
+      await this.client.set(fullKey, JSON.stringify(versioned), { pxat: deadline });
       this.onStateChange?.(true);
     } catch (err) {
       this.onStateChange?.(false);
@@ -202,6 +261,8 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
         keyLength: key.length,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      this.expiryByKey.delete(fullKey);
     }
   }
 
@@ -217,10 +278,13 @@ export class RedisIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
  * but duplicate protection is not enforced across instances or restarts.
  */
 export class NoOpIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
-  async get(_key: string): Promise<IdempotentEntry<T> | null> {
+  async start(_key: string, _tenantId: string, _ttlSeconds: number): Promise<boolean> {
+    return true;
+  }
+  async get(_key: string, _tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null> {
     return null;
   }
-  async set(_key: string, _entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {}
+  async set(_key: string, _tenantId: string, _entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {}
   async close(): Promise<void> {}
 }
 
@@ -231,14 +295,40 @@ export class NoOpIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
  * across instances).
  */
 export class InMemoryIdempotencyStore<T = unknown> implements IdempotencyStore<T> {
-  private readonly store = new Map<string, IdempotentEntry<T>>();
+  private readonly store = new Map<string, { entry: IdempotentEntry<T> | 'in_progress'; expiresAt: number }>();
 
-  async get(key: string): Promise<IdempotentEntry<T> | null> {
-    return this.store.get(key) ?? null;
+  private buildKey(key: string, tenantId: string): string {
+    return `${tenantId}:${key}`;
   }
 
-  async set(key: string, entry: IdempotentEntry<T>, _ttlSeconds: number): Promise<void> {
-    this.store.set(key, entry);
+  async start(key: string, tenantId: string, ttlSeconds: number): Promise<boolean> {
+    const fullKey = this.buildKey(key, tenantId);
+    const existing = this.store.get(fullKey);
+    const now = performance.now();
+    if (existing && now < existing.expiresAt) {
+      return false; // Already exists or in progress
+    }
+    this.store.set(fullKey, { entry: 'in_progress', expiresAt: now + ttlSeconds * 1000 });
+    return true;
+  }
+
+  async get(key: string, tenantId: string): Promise<IdempotentEntry<T> | 'in_progress' | null> {
+    const fullKey = this.buildKey(key, tenantId);
+    const cached = this.store.get(fullKey);
+    if (!cached || performance.now() >= cached.expiresAt) {
+      return null;
+    }
+    return cached.entry;
+  }
+
+  async set(key: string, tenantId: string, entry: IdempotentEntry<T>, ttlSeconds: number): Promise<void> {
+    const fullKey = this.buildKey(key, tenantId);
+    const now = performance.now();
+    const existing = this.store.get(fullKey);
+    const expiresAt = existing?.entry === 'in_progress'
+      ? existing.expiresAt
+      : now + ttlSeconds * 1000;
+    this.store.set(fullKey, { entry, expiresAt });
   }
 
   clear(): void {

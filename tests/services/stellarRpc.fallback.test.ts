@@ -10,6 +10,8 @@ import { createRpcDegradationMiddleware } from '../../src/middleware/rpcDegradat
 import {
   InMemoryRpcFallbackCache,
   RedisRpcFallbackCache,
+  buildRpcFallbackCacheKey,
+  buildUnsafeCacheKeyForTest,
   type RpcFallbackCache,
 } from '../../src/redis/rpcFallbackCache.js';
 import type { RedisClient } from '../../src/redis/client.js';
@@ -42,10 +44,11 @@ describe('StellarRpcService fallback cache', () => {
       get: vi.fn(async () => null),
       set: vi.fn(async () => undefined),
     };
-    const svc = new StellarRpcService(
-      () => makeClient(vi.fn(async () => ({ sequence: 101 }))),
-      { failureThreshold: 1, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
-    );
+    const svc = new StellarRpcService(() => makeClient(vi.fn(async () => ({ sequence: 101 }))), {
+      failureThreshold: 1,
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 101 });
 
@@ -61,10 +64,12 @@ describe('StellarRpcService fallback cache', () => {
       if (shouldFail) throw new Error('rpc down');
       return { sequence: 200 };
     });
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
-    );
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      failureThreshold: 1,
+      resetTimeoutMs: 60_000,
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 200 });
     shouldFail = true;
@@ -79,10 +84,11 @@ describe('StellarRpcService fallback cache', () => {
     const getLatestLedger = vi.fn(async () => {
       throw new Error('rpc down');
     });
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: new InMemoryRpcFallbackCache() },
-    );
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      failureThreshold: 1,
+      resetTimeoutMs: 60_000,
+      fallbackCache: new InMemoryRpcFallbackCache(),
+    });
 
     await expect(svc.getLatestLedger()).rejects.toThrow('rpc down');
     await expect(svc.getLatestLedger()).rejects.toBeInstanceOf(CircuitOpenError);
@@ -97,10 +103,12 @@ describe('StellarRpcService fallback cache', () => {
       if (shouldFail) throw new Error('rpc down');
       return { sequence };
     });
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { failureThreshold: 1, resetTimeoutMs: 1_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
-    );
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      failureThreshold: 1,
+      resetTimeoutMs: 1_000,
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 300 });
     shouldFail = true;
@@ -122,10 +130,12 @@ describe('StellarRpcService fallback cache', () => {
       if (shouldFail) throw new Error('rpc down');
       return { sequence: 400 };
     });
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 1 },
-    );
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      failureThreshold: 1,
+      resetTimeoutMs: 60_000,
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 1,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 400 });
     vi.advanceTimersByTime(1_001);
@@ -136,6 +146,7 @@ describe('StellarRpcService fallback cache', () => {
   });
 
   it('isolates accountExists cache entries by hashed account parameter', async () => {
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
     const cache = new InMemoryRpcFallbackCache();
     const fetchMock = vi.fn(async (url: string) => ({
       status: url.endsWith('/GBEXISTS') ? 200 : 404,
@@ -145,7 +156,7 @@ describe('StellarRpcService fallback cache', () => {
     let horizonUrl = 'https://horizon.test';
     const svc = new StellarRpcService(
       () => ({ getLatestLedger: vi.fn(), horizonUrl }),
-      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
+      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60, maxRetries: 0, retryDelayMs: 0 },
     );
 
     await expect(svc.accountExists('GBEXISTS')).resolves.toBe(true);
@@ -163,10 +174,12 @@ describe('StellarRpcService fallback cache', () => {
       if (shouldFail) throw new Error('rpc down');
       return { sequence: 500 };
     });
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { failureThreshold: 1, resetTimeoutMs: 60_000, fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
-    );
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      failureThreshold: 1,
+      resetTimeoutMs: 60_000,
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 500 });
     shouldFail = true;
@@ -187,10 +200,10 @@ describe('StellarRpcService fallback cache', () => {
 
   it('stores cache metadata while preserving value reads', async () => {
     const cache = new InMemoryRpcFallbackCache();
-    const svc = new StellarRpcService(
-      () => makeClient(vi.fn(async () => ({ sequence: 600 }))),
-      { fallbackCache: cache, fallbackCacheTtlSeconds: 60 },
-    );
+    const svc = new StellarRpcService(() => makeClient(vi.fn(async () => ({ sequence: 600 }))), {
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 600 });
 
@@ -205,22 +218,23 @@ describe('StellarRpcService fallback cache', () => {
 
   it('serves a CLOSED-cache hit and starts one probabilistic early refresh', async () => {
     const cache = new InMemoryRpcFallbackCache();
-    await cache.setEntry(
-      'getLatestLedger',
-      { sequence: 700 },
-      60,
-      [],
-      { nowMs: Date.now() - 59_500, refreshDurationMs: 1_000 },
-    );
+    await cache.setEntry('getLatestLedger', { sequence: 700 }, 60, [], {
+      nowMs: Date.now() - 59_500,
+      refreshDurationMs: 1_000,
+    });
     let resolver: ((value: { sequence: number }) => void) | undefined;
-    const getLatestLedger = vi.fn(() => new Promise<{ sequence: number }>((resolve) => {
-      resolver = resolve;
-    }));
-    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(Number.EPSILON);
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { fallbackCache: cache, fallbackCacheTtlSeconds: 60, fallbackCacheEarlyExpiryBeta: 1 },
+    const getLatestLedger = vi.fn(
+      () =>
+        new Promise<{ sequence: number }>((resolve) => {
+          resolver = resolve;
+        })
     );
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(Number.EPSILON);
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+      fallbackCacheEarlyExpiryBeta: 1,
+    });
 
     const first = await svc.getLatestLedger();
     const second = await svc.getLatestLedger();
@@ -243,10 +257,11 @@ describe('StellarRpcService fallback cache', () => {
   it('records CLOSED-cache misses before the first live RPC fill', async () => {
     const cache = new InMemoryRpcFallbackCache();
     const getLatestLedger = vi.fn(async () => ({ sequence: 800 }));
-    const svc = new StellarRpcService(
-      () => makeClient(getLatestLedger),
-      { fallbackCache: cache, fallbackCacheTtlSeconds: 60, fallbackCacheEarlyExpiryBeta: 1 },
-    );
+    const svc = new StellarRpcService(() => makeClient(getLatestLedger), {
+      fallbackCache: cache,
+      fallbackCacheTtlSeconds: 60,
+      fallbackCacheEarlyExpiryBeta: 1,
+    });
 
     await expect(svc.getLatestLedger()).resolves.toEqual({ sequence: 800 });
 
@@ -265,14 +280,10 @@ describe('rpcFallbackCache key collisions', () => {
 
     // Build a tuple-pair that would collide under a naive delimiter-join
     // (operation/parts treated as raw, unescaped string segments).
-
-
-
-
     const operation1 = 'getLatestLedger';
     const parts1 = ['a', 'b'];
 
-    const operation2 = 'getLatestLedger::a';
+    const operation2 = 'getLatestLedger_a';
     const parts2 = ['b'];
 
     // Ensure safe inputs (avoid relying on delimiter-forging characters).
@@ -290,13 +301,41 @@ describe('rpcFallbackCache key collisions', () => {
     await expect(cache.get<{ v: number }>(operation2, parts1)).resolves.toBeNull();
   });
 
+  it('maps near-colliding delimiter-forging inputs to distinct keys', () => {
+    // A naive delimiter-join builder would map these to the same key. The
+    // test-only builder skips the SAFE_OPERATION allow-list so genuinely
+    // near-colliding inputs can be constructed and asserted against.
+    const keyA = buildUnsafeCacheKeyForTest('getLatestLedger', ['a', 'b']);
+    const keyB = buildUnsafeCacheKeyForTest('getLatestLedger', ['a::b']);
+    expect(keyA).not.toBe(keyB);
+
+    // Different operation names with the same parts must also differ.
+    const keyC = buildUnsafeCacheKeyForTest('getAccount', ['a', 'b']);
+    expect(keyC).not.toBe(keyA);
+  });
+
+  it('generates distinct keys for near-colliding inputs using buildRpcFallbackCacheKey', () => {
+    const key1 = buildRpcFallbackCacheKey('getAccount', ['a', 'b']);
+    const key2 = buildRpcFallbackCacheKey('getAccount', ['ab']);
+    const key3 = buildRpcFallbackCacheKey('getAccount', ['a', 'b', 'c']);
+
+    expect(key1).not.toBe(key2);
+    expect(key1).not.toBe(key3);
+    expect(key2).not.toBe(key3);
+
+    expect(key1).toContain('rpc:cache::v2::op:');
+    expect(key2).toContain('rpc:cache::v2::op:');
+  });
+
   it('rejects unsafe key parts under SAFE_OPERATION', async () => {
     const cache = new InMemoryRpcFallbackCache();
 
     // ':' is not allowed by SAFE_OPERATION
     await expect(cache.setEntry('getLatestLedger', { v: 1 }, 60, ['bad:part'])).rejects.toThrow(
-      /unsafe characters/i,
+      /unsafe characters/i
     );
+    // Operations with unsafe characters are also rejected.
+    await expect(cache.setEntry('bad:op', { v: 1 }, 60, [])).rejects.toThrow(/unsafe characters/i);
   });
 });
 
@@ -313,18 +352,18 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     const result = await cache.get('testOp');
 
     expect(result).toBeNull();
-    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('rpc:cache::v2::op:'));
     expect(cache.corruptEntriesTotal).toBe(1);
-    
+
     const metric = await fluxora_rpc_cache_corrupt_total.get();
     expect(metric.values[0]?.value).toBe(1);
     expect(metric.values[0]?.labels).toEqual({ operation: 'unknown', reason: 'syntax_error' });
@@ -337,16 +376,16 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     const result = await cache.get('testOp');
 
     expect(result).toBeNull();
-    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('rpc:cache::v2::op:'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
     const metric = await fluxora_rpc_cache_corrupt_total.get();
@@ -361,16 +400,16 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     const result = await cache.get('testOp');
 
     expect(result).toBeNull();
-    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('testOp'));
+    expect(fakeRedis.del).toHaveBeenCalledWith(expect.stringContaining('rpc:cache::v2::op:'));
     expect(cache.corruptEntriesTotal).toBe(1);
 
     const metric = await fluxora_rpc_cache_corrupt_total.get();
@@ -385,10 +424,10 @@ describe('corrupt cache entries', () => {
       setNx: vi.fn(),
       del: vi.fn(),
       exists: vi.fn(),
+      incr: vi.fn(),
       close: vi.fn(),
       multi: vi.fn(),
-      zcount: vi.fn(),
-    };
+      zcount: vi.fn(), incr: vi.fn(), };
     const cache = new RedisRpcFallbackCache(fakeRedis);
 
     await expect(cache.get('testOp')).rejects.toThrow('ECONNREFUSED');

@@ -1,3 +1,4 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Centralized admin state for operator-grade controls.
  *
@@ -71,7 +72,7 @@ export class AdminStatePersistenceError extends Error {
 }
 
 function resolveAdminStatePath(): string {
-  const configured = process.env.ADMIN_STATE_FILE?.trim();
+  const configured = getRuntimeEnv().ADMIN_STATE_FILE?.trim();
   return configured && configured.length > 0 ? configured : DEFAULT_ADMIN_STATE_FILE;
 }
 
@@ -217,6 +218,10 @@ export function isStreamCreationPaused(): boolean {
 
 export function getReindexState(): ReindexState {
   return { ...state.reindex };
+}
+
+export function getReindexLock(): Lock | null {
+  return reindexLock;
 }
 
 /**

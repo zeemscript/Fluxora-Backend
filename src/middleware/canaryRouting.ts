@@ -1,18 +1,19 @@
+import { getRuntimeEnv } from '../config/runtime-env.js';
 /**
  * Canary Routing Middleware
  *
- * Performs a stable, deterministic per-request canary traffic split using a
- * SHA-256 hash of the client identity (API key when present, falling back to
- * client IP). A configurable percentage of requests are tagged as canary by
- * setting `req.isCanary = true` and echoing an `X-Fluxora-Canary: true`
+ * Performs a stable canary traffic split using a session identity when one is
+ * available, falling back to the client identity (API key or client IP). A
+ * configurable percentage of requests are tagged as canary by setting
+ * `req.isCanary` and echoing an `X-Fluxora-Canary: true|false`
  * response header so operators can correlate canary traffic in logs and
  * metrics.
  *
  * Design goals
  * ─────────────
- * 1. Determinism — the same client always lands in the same bucket for the
- *    lifetime of a deployment. Routing is a pure function of
- *    (clientIdentity, CANARY_SALT, CANARY_TRAFFIC_PERCENT).
+ * 1. Stickiness — the first decision for a session is retained for the
+ *    lifetime of the middleware instance, so requests in one flow cannot
+ *    switch variants.
  *
  * 2. Independence — uses its own CANARY_SALT so canary bucketing is
  *    completely uncorrelated from any feature-flag rollout hashes that may
@@ -38,9 +39,9 @@
  *
  * Algorithm
  * ─────────
- * 1. Identify the client: prefer the `X-API-Key` request header; fall back
- *    to `req.ip` (Express-resolved, trusts proxy when app trust-proxy is set).
- * 2. Compute: SHA-256(CANARY_SALT + ':' + clientIdentity)
+ * 1. Identify the session: prefer the `X-Session-ID` request header. When it
+ *    is absent, prefer `X-API-Key`, then fall back to `req.ip`.
+ * 2. Compute: SHA-256(CANARY_SALT + ':' + identity)
  * 3. Take the first 8 hex characters of the digest → parse as uint32.
  * 4. Map to [0, 100) via: bucket = uint32 % 100
  * 5. Tag as canary when: bucket < CANARY_TRAFFIC_PERCENT
@@ -64,6 +65,9 @@ import { logger } from '../lib/logger.js';
  * integration tests can observe the canary decision without inspecting logs.
  */
 export const CANARY_HEADER = 'X-Fluxora-Canary';
+
+/** Request header used to identify a session for sticky canary assignment. */
+export const SESSION_HEADER = 'X-Session-ID';
 
 /**
  * Default salt used when CANARY_SALT is not set.
@@ -134,6 +138,16 @@ export function resolveClientIdentity(req: Request): string | undefined {
   return undefined;
 }
 
+/** Resolve the session identity used for sticky canary assignment. */
+export function resolveSessionIdentity(req: Request): string | undefined {
+  const sessionId = req.headers[SESSION_HEADER.toLowerCase()];
+  if (typeof sessionId === 'string' && sessionId.trim().length > 0) {
+    return sessionId.trim();
+  }
+
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Middleware factory (accepts explicit config for testability)
 // ---------------------------------------------------------------------------
@@ -142,7 +156,7 @@ export function resolveClientIdentity(req: Request): string | undefined {
  * Options accepted by `createCanaryRoutingMiddleware`.
  *
  * All fields are optional; production callers should rely on environment
- * variables. Tests may pass explicit values to avoid polluting process.env.
+ * variables. Tests may pass explicit values to avoid polluting getRuntimeEnv().
  */
 export interface CanaryRoutingOptions {
   /**
@@ -172,7 +186,11 @@ export interface CanaryRoutingOptions {
  * app.use(createCanaryRoutingMiddleware());
  * ```
  */
-export function createCanaryRoutingMiddleware(options: CanaryRoutingOptions = {}) {
+export function createCanaryRoutingMiddleware(
+  options: CanaryRoutingOptions = {},
+): (req: Request, res: Response, next: NextFunction) => void {
+  const sessionAssignments = new Map<string, boolean>();
+
   return function canaryRoutingMiddleware(
     req: Request,
     res: Response,
@@ -183,22 +201,25 @@ export function createCanaryRoutingMiddleware(options: CanaryRoutingOptions = {}
     const trafficPercent =
       options.trafficPercent ??
       (() => {
-        const raw = process.env['CANARY_TRAFFIC_PERCENT'];
+        const raw = getRuntimeEnv()['CANARY_TRAFFIC_PERCENT'];
         if (raw === undefined || raw === '') return 0;
         const parsed = parseInt(raw, 10);
         return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed : 0;
       })();
 
     const salt =
-      options.salt ?? (process.env['CANARY_SALT'] ?? DEFAULT_CANARY_SALT);
+      options.salt ?? (getRuntimeEnv()['CANARY_SALT'] ?? DEFAULT_CANARY_SALT);
 
     // ── Fast path: canary disabled ────────────────────────────────────────
 
     if (trafficPercent === 0) {
       req.isCanary = false;
+      res.setHeader(CANARY_HEADER, 'false');
       next();
       return;
     }
+
+    const sessionIdentity = resolveSessionIdentity(req);
 
     // ── Resolve client identity ───────────────────────────────────────────
 
@@ -214,30 +235,37 @@ export function createCanaryRoutingMiddleware(options: CanaryRoutingOptions = {}
         { component: 'canary-routing' },
       );
       req.isCanary = false;
+      res.setHeader(CANARY_HEADER, 'false');
       next();
       return;
     }
 
     // ── Compute bucket and apply decision ─────────────────────────────────
 
-    const bucket = computeCanaryBucket(salt, identity);
-    const isCanary = bucket < trafficPercent;
+    const cachedAssignment = sessionIdentity === undefined
+      ? undefined
+      : sessionAssignments.get(sessionIdentity);
+    const bucket = computeCanaryBucket(salt, sessionIdentity ?? identity);
+    const isCanary = cachedAssignment ?? bucket < trafficPercent;
+
+    if (sessionIdentity !== undefined && cachedAssignment === undefined) {
+      sessionAssignments.set(sessionIdentity, isCanary);
+    }
 
     req.isCanary = isCanary;
+    res.setHeader(CANARY_HEADER, String(isCanary));
 
-    if (isCanary) {
-      res.setHeader(CANARY_HEADER, 'true');
-
-      logger.debug(
-        'Canary routing: request tagged as canary',
-        req.correlationId,
-        {
-          component: 'canary-routing',
-          bucket,
-          trafficPercent,
-        },
-      );
-    }
+    logger.debug(
+      'Canary routing: session assignment resolved',
+      req.correlationId,
+      {
+        component: 'canary-routing',
+        bucket,
+        trafficPercent,
+        isCanary,
+        sticky: sessionIdentity !== undefined,
+      },
+    );
 
     next();
   };

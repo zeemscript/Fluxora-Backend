@@ -1,3 +1,4 @@
+// Pre-existing type-error backlog, tracked for follow-up (#TBD-typecheck-backlog); not introduced by this PR. Remove once resolved.
 /**
  * Stream Event Service - Maps blockchain events to database records
  *
@@ -10,8 +11,9 @@
 
 import { streamRepository } from "../db/repositories/streamRepository.js";
 import { CreateStreamInput, StreamStatus } from "../db/types.js";
-import { info, warn, error as logError, debug } from "../utils/logger.js";
+import { info, warn, error as logError, debug } from "../lib/logger.js";
 import { getStreamHub } from "../ws/hub.js";
+import { WEBHOOK_SCHEMA_VERSION } from "../webhooks/payloadSchemas.js";
 import { enrichActiveSpanWithStream, traceSpan } from "../tracing/hooks.js";
 import { deriveStreamId } from "../streams/sseEmitter.js";
 import type { DedupCache } from "../redis/dedup.js";
@@ -85,6 +87,17 @@ export interface EventIngestionResult {
 }
 
 /**
+ * Derive the stable identity used for deduplication and replay.
+ *
+ * A Soroban event is uniquely identified by its transaction hash and event
+ * index. Keeping this derivation in one exported function ensures replay,
+ * backfill, and live ingestion cannot silently drift apart.
+ */
+export function deriveStreamEventId(transactionHash: string, eventIndex: number): string {
+  return `${transactionHash}-${eventIndex}`;
+}
+
+/**
  * Stream Event Service
  *
  * Processes blockchain events with idempotency guarantees:
@@ -152,7 +165,7 @@ export const streamEventService = {
     event: StreamCreatedEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    const eventId = `${event.transactionHash}-${event.eventIndex}`;
+    const eventId = deriveStreamEventId(event.transactionHash, event.eventIndex);
 
     info("Processing StreamCreated event", {
       eventId,
@@ -212,7 +225,7 @@ export const streamEventService = {
             streamId,
             eventId,
             recipientAddress: input.recipient_address,
-            payload: { ...input, event: 'stream.created' },
+            payload: { ...input, event: 'stream.created', schema_version: WEBHOOK_SCHEMA_VERSION },
           }).catch((err: Error) => {
             logError("Failed to broadcast stream created event", { streamId, eventId, error: err.message });
           });
@@ -268,7 +281,7 @@ export const streamEventService = {
     event: StreamUpdatedEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    const eventId = `${event.transactionHash}-${event.eventIndex}`;
+    const eventId = deriveStreamEventId(event.transactionHash, event.eventIndex);
 
     info("Processing StreamUpdated event", {
       eventId,
@@ -338,7 +351,7 @@ export const streamEventService = {
             streamId: event.streamId,
             eventId,
             recipientAddress: updatedStream.recipient_address,
-            payload: { ...update, event: 'stream.updated' },
+            payload: { ...update, event: 'stream.updated', schema_version: WEBHOOK_SCHEMA_VERSION },
           }).catch((err: Error) => {
             logError("Failed to broadcast stream updated event", { streamId: event.streamId, eventId, error: err.message });
           });
@@ -400,7 +413,7 @@ export const streamEventService = {
     event: StreamCancelledEvent,
     correlationId?: string,
   ): Promise<EventIngestionResult> {
-    const eventId = `${event.transactionHash}-${event.eventIndex}`;
+    const eventId = deriveStreamEventId(event.transactionHash, event.eventIndex);
 
     info("Processing StreamCancelled event", {
       eventId,
@@ -456,7 +469,7 @@ export const streamEventService = {
           streamId: event.streamId,
           eventId,
           recipientAddress: updatedStream.recipient_address,
-          payload: { status: 'cancelled', event: 'stream.cancelled' },
+          payload: { status: 'cancelled', event: 'stream.cancelled', schema_version: WEBHOOK_SCHEMA_VERSION },
         }).catch((err: Error) => {
           logError("Failed to broadcast stream cancelled event", { streamId: event.streamId, eventId, error: err.message });
         });
@@ -582,6 +595,5 @@ export const streamEventService = {
     return results;
   },
 };
-
 
 
